@@ -57,12 +57,17 @@ function geoBBox(feature) {
 }
 
 // ===== Build match expression for fill-color by region =====
-function buildColorExpr() {
+// Only provinces in activeIds get region color; everything else → gray default
+function buildColorExpr(activeIds) {
   const entries = [];
-  for (const [id, info] of Object.entries(provinceMap)) {
-    entries.push(id, regionColors[info.region]?.fill || '#444');
+  if (activeIds && activeIds.size > 0) {
+    for (const id of activeIds) {
+      const info = provinceMap[id];
+      if (info) entries.push(id, regionColors[info.region]?.fill || '#444');
+    }
   }
-  return ['match', ['get', 'id'], ...entries, '#444'];
+  if (entries.length === 0) return '#333340';
+  return ['match', ['get', 'id'], ...entries, '#333340'];
 }
 
 // ===== Build label expression: id → name_th =====
@@ -159,11 +164,13 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const pulseRef = useRef(null);
+  const staggerRef = useRef(null);
   const worldGeoCache = useRef(null);
   const [mapReady, setMapReady] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [highlightedId, setHighlightedId] = useState(null);
   const [dotTooltip, setDotTooltip] = useState(null);
+  const [clickedDot, setClickedDot] = useState(null);
   const [selectedCountry, setSelectedCountry] = useState(null);
 
   // Reset on viewMode change
@@ -181,7 +188,17 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
     if (showAll) setShowAll(false);
     if (highlightedId) setHighlightedId(null);
     if (dotTooltip) setDotTooltip(null);
+    if (clickedDot) setClickedDot(null);
   }
+
+  // ===== Set of provinces that have customer data =====
+  const activeProvinces = useMemo(() => {
+    const ids = new Set();
+    for (const c of customers) {
+      if (c.provinceId) ids.add(c.provinceId);
+    }
+    return ids;
+  }, [customers]);
 
   // Auto-scroll to highlighted card
   useEffect(() => {
@@ -251,7 +268,7 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
         type: 'fill',
         source: 'provinces',
         paint: {
-          'fill-color': buildColorExpr(),
+          'fill-color': '#333340',
           'fill-opacity': 0.6,
         },
       });
@@ -523,6 +540,7 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
 
     return () => {
       if (pulseRef.current) cancelAnimationFrame(pulseRef.current);
+      if (staggerRef.current) clearInterval(staggerRef.current);
       map.remove();
       mapRef.current = null;
     };
@@ -564,7 +582,18 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
     };
     const onDotLeave = () => { setHighlightedId(null); setDotTooltip(null); };
     const onDotClick = (e) => {
-      if (e.features.length > 0) setHighlightedId(e.features[0].properties.cid);
+      if (e.features.length > 0) {
+        const props = e.features[0].properties;
+        setHighlightedId(props.cid);
+        setClickedDot({
+          cid: props.cid,
+          name: props.name,
+          amount: Number(props.amount),
+          tickets: Number(props.tickets),
+          avatar: props.avatar,
+          drawDate: props.drawDate,
+        });
+      }
     };
 
     map.on('mousemove', 'winners-dots', onDotMove);
@@ -581,6 +610,7 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
+    if (viewMode !== 'TH') return; // INTL mode handled by its own effects
 
     // --- Camera ---
     if (selectedProvince) {
@@ -599,11 +629,13 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
       map.easeTo({ center: THAI_CENTER, zoom: INIT_ZOOM, pitch: INIT_PITCH, bearing: INIT_BEARING, duration: 800 });
     }
 
-    // --- Province fill: gray-out non-selected region ---
+    // --- Province fill: gray-out non-selected region + no-data provinces ---
     if (selectedRegion) {
       const grayExpr = [];
       for (const [id, info] of Object.entries(provinceMap)) {
-        grayExpr.push(id, info.region === selectedRegion ? regionColors[info.region].fill : '#D9D9D9');
+        const inRegion = info.region === selectedRegion;
+        const hasData = activeProvinces.has(id);
+        grayExpr.push(id, inRegion ? (hasData ? regionColors[info.region].fill : '#333340') : '#D9D9D9');
       }
       map.setPaintProperty('provinces-fill', 'fill-color', ['match', ['get', 'id'], ...grayExpr, '#D9D9D9']);
       map.setPaintProperty('provinces-fill', 'fill-opacity', ['match', ['get', 'id'],
@@ -613,7 +645,9 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
         0.25,
       ]);
     } else {
-      map.setPaintProperty('provinces-fill', 'fill-color', buildColorExpr());
+      const colorExpr = buildColorExpr(activeProvinces);
+      console.log('[GRAY DEBUG] activeProvinces size:', activeProvinces.size, 'has TH71:', activeProvinces.has('TH71'), 'expr type:', typeof colorExpr === 'string' ? colorExpr : 'match[' + (colorExpr.length - 3) / 2 + ']');
+      map.setPaintProperty('provinces-fill', 'fill-color', colorExpr);
       map.setPaintProperty('provinces-fill', 'fill-opacity', 0.6);
     }
 
@@ -636,7 +670,9 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
       map.setPaintProperty('province-labels', 'text-opacity', 0.85);
     }
 
-    // --- Winner dots ---
+    // --- Winner dots (staggered entrance) ---
+    if (staggerRef.current) { clearInterval(staggerRef.current); staggerRef.current = null; }
+
     if (selectedProvince) {
       const feature = thailandGeo.features.find((f) => f.properties.id === selectedProvince);
       if (feature) {
@@ -645,14 +681,24 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
         const dotFeatures = provCustomers.map((c, i) => ({
           type: 'Feature',
           geometry: { type: 'Point', coordinates: dotPositions[i] || featureCentroid(feature) },
-          properties: { cid: c.id, name: `${c.name} ${c.surname}`, amount: c.amount },
+          properties: { cid: c.id, name: `${c.name} ${c.surname}`, amount: c.amount, tickets: c.tickets, avatar: c.avatar, drawDate: c.drawDate || '' },
         }));
-        map.getSource('winners').setData({ type: 'FeatureCollection', features: dotFeatures });
+        // Staggered reveal — dots appear one by one
+        let revealed = 0;
+        map.getSource('winners').setData({ type: 'FeatureCollection', features: [] });
+        staggerRef.current = setInterval(() => {
+          revealed = Math.min(revealed + 1, dotFeatures.length);
+          map.getSource('winners').setData({ type: 'FeatureCollection', features: dotFeatures.slice(0, revealed) });
+          if (revealed >= dotFeatures.length) {
+            clearInterval(staggerRef.current);
+            staggerRef.current = null;
+          }
+        }, 80);
       }
     } else {
       map.getSource('winners').setData({ type: 'FeatureCollection', features: [] });
     }
-  }, [mapReady, selectedRegion, selectedProvince, customers]);
+  }, [mapReady, viewMode, selectedRegion, selectedProvince, customers, activeProvinces]);
 
   // ===== Highlight dot on map when card hovered =====
   useEffect(() => {
@@ -1125,6 +1171,34 @@ function MapboxMap({ customers = [], viewMode = 'TH', onSetIntl, selectedRegion,
               +{intlData.remaining} ดูทั้งหมด
             </button>
           )}
+        </div>
+      )}
+
+      {/* Game-like winner popup */}
+      {clickedDot && (
+        <div className="game-popup-overlay" onClick={() => setClickedDot(null)}>
+          <div className="game-popup" onClick={(e) => e.stopPropagation()}>
+            <button className="game-popup-close" onClick={() => setClickedDot(null)}>&times;</button>
+            <div className="game-popup-avatar-ring">
+              <img className="game-popup-avatar" src={clickedDot.avatar} alt="" />
+            </div>
+            <div className="game-popup-name">{clickedDot.name}</div>
+            <div className="game-popup-badge">WINNER</div>
+            <div className="game-popup-stats">
+              <div className="game-popup-stat">
+                <div className="game-popup-stat-val neon-green">{clickedDot.amount.toLocaleString('th-TH')}</div>
+                <div className="game-popup-stat-lbl">บาท</div>
+              </div>
+              <div className="game-popup-divider" />
+              <div className="game-popup-stat">
+                <div className="game-popup-stat-val">{clickedDot.tickets}</div>
+                <div className="game-popup-stat-lbl">ใบ</div>
+              </div>
+            </div>
+            {clickedDot.drawDate && (
+              <div className="game-popup-date">{clickedDot.drawDate}</div>
+            )}
+          </div>
         </div>
       )}
 
